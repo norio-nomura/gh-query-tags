@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+
+function help() {
+  cat <<EOF
+Query the GitHub repository and print the tags that point to the commit 
+specified by hash or whose names match the pattern.
+
+The tag with the latest commit date matching the condition will be output.
+If -A/--all flag is specified, all tags matching the condition will be printed 
+in order of the most recent commit date.
+
+USAGE
+  gh query-tags [[<sha1> | <pattern>] ...] [flags]
+
+FLAGS
+  -A, --all                Print all matching tags in order of the most recent
+                           commit date.
+  -R, --repo [OWNER/]REPO  Select repository using the [OWNER/]REPO format
+
+INHERITED FLAGS
+  --help   Show help for command
+
+ARGUMENTS
+  Arguments matching /^[0-9a-f]{7,}$/ are treated as commit hash pointed by tag,
+  and the rest as regular expression patterns for tag names.
+
+USE STANDARD INPUT
+  Reads standard input, searches for words that match the hash pattern, and uses
+  them as hashes.
+
+EXAMPLES
+  # print tag in apple/swift pointing commit with hash 8ae983c3480462b
+  $ gh query-tags --repo apple/swift 8ae983c3480462b
+
+  # print tag in apple/swift pointing commit with hash provided by 
+  # swift -version in swiftlang/swift:nightly
+  $ docker run --rm swiftlang/swift:nightly swift -version | gh query-tags --repo apple/swift
+
+EOF
+}
+
+function is_hash() {
+  [[ "${1}" =~ ^[0-9a-f]{7,}$ ]]
+}
+
+function read_hashes_from_stdin() {
+  [[ ! -t 0 ]] || exit
+  local INPUTS=() input
+  IFS=$' \t\n-,:()' read -d '' -r -a INPUTS
+  for input in "${INPUTS[@]}"; do
+    is_hash ${input} && echo "\"${input}\""
+  done
+}
+
+# options
+hashes=($(read_hashes_from_stdin)) # taking hashes from stdin
+patterns=()
+print_all=0
+owner='{owner}'
+repo='{repo}'
+
+# parse arguments
+while [[ $# -gt 0 ]]; do
+  case "${1}" in
+    -A|--all)
+      print_all=1
+      shift
+      ;;
+    -R|--repo)
+      case "${2}" in
+        */*)
+          owner="${2%%/*}"
+          repo="${2#*/}"
+          ;;
+        *)
+          repo="${2}"
+          ;;
+      esac
+      shift 2
+      ;;
+    --help)
+      help
+      exit
+      ;;
+    -*|--*)
+      echo "Unknown option ${1}"
+      exit 1
+      ;;
+    *)
+      if is_hash "${1}"; then
+        hashes+=("\"${1}\"")
+      elif [[ -n "${1}" ]]; then
+        patterns+=("\"${1}\"")
+      fi
+      shift
+      ;;
+  esac
+done
+
+# Using the gh api command to retrieve information
+readonly QUERY='
+  query($owner: String!, $name: String!, $endCursor: String) {
+    repository(owner: $owner, name: $name) {
+      refs(refPrefix: "refs/tags/", first: 100, after: $endCursor, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
+        pageInfo {
+          endCursor
+          hasNextPage
+        }
+        tags: nodes {
+          name
+          target {
+            ... on Tag {
+              commit: target {
+                oid
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+'
+
+function printf_with_joined_arguments() {
+  local format="${1}" arguments=()
+  while shift 1; do
+    test -n "${1}" && arguments+=("${1}") # non empty arguments only
+  done
+  [[ ${#arguments[@]} -ne 0 ]] && (IFS=,; printf "${format}" "${arguments[*]}") # arguments are joined with ","
+}
+
+# Build jq query
+readonly CONDITIONS=(
+  "$(printf_with_joined_arguments "(.target.commit.oid|startswith(%s)?)" "${hashes[@]}")"
+  "$(printf_with_joined_arguments "(.name|test(%s))" "${patterns[@]}")"
+)
+readonly SELECT="$(printf_with_joined_arguments "|select([%s]|any)" "${CONDITIONS[@]}")"
+readonly JQ=".data.repository.refs|((.pageInfo|.hasNextPage,.endCursor),(.tags[]${SELECT}|.name))"
+
+# Run loops
+cursor="" found=
+readonly QUERY_CMD=(gh api graphql --cache 5m -f query="${QUERY}" --field owner="${owner}" --field name="${repo}" --jq "${JQ}")
+while result=($("${QUERY_CMD[@]}" --field endCursor="${cursor}")); do
+  if [[ ${#result[@]} -gt 2 ]]; then # found tag
+    found=1
+    if [[ $print_all -eq 0 ]]; then
+      echo ${result[2]}
+      break
+    else
+      printf "%s\n" "${result[@]:2}"
+    fi
+  fi
+  [[ "${result[0]}" != "true" ]] && break
+  cursor="${result[1]}"
+done
+test -n ${found} # set exit status
