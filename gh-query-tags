@@ -16,7 +16,8 @@ FLAGS
   -A, --all                   Print all matching tags in order of the most recent commit/release date
       --exclude-pre-release   Exclude tags used for release marked as pre-release. Implicitly set --use-release
       --include-draft         Include tags used for release marked as draft. Implicitly set --use-release
-      --jq expression         Filter JSON output using a jq expression. Implicitly set --json
+      --jq expression         Filter JSON output using a jq expression that will be applied to each tag or release object.
+                              Implicitly set --json
       --json                  Output JSON
       --use-release           Use releases to query tags. If tags are not used to release, it will be ignored.
 
@@ -222,6 +223,7 @@ CONDITIONS=()
 
 JQ_NODES_EXPRESSIONS=(".nodes" "map($(join "|" "${JQ_MAP_EXPRESSIONS[@]}"))")
 [[ ${print_json} -eq 1 ]] || JQ_NODES_EXPRESSIONS+=("map(.name)")
+[[ ${#jq_options[@]} -ne 0 ]] && JQ_NODES_EXPRESSIONS+=("map(${jq_options[@]})")
 if [[ ${print_all} -eq 1 ]]; then
   JQ_NODES_EXPRESSIONS+=(".[]")
 else
@@ -231,7 +233,7 @@ fi
 # shellcheck disable=SC2155
 readonly JQ=".data.repository.conn|(
   (.pageInfo|.hasNextPage, .endCursor),
-  ($(join "|" "${JQ_NODES_EXPRESSIONS[@]}" "${jq_options[@]}"))
+  ($(join "|" "${JQ_NODES_EXPRESSIONS[@]}"))
 )"
 
 # Run loops
