@@ -1,32 +1,34 @@
 #!/usr/bin/env bash
 
 function help() {
-  cat <<EOF
+	cat <<EOF
 Query the GitHub repository and print the tags that point to the commit 
-specified by hash or whose names match the pattern.
+specified by hash or whose names or releases information match the pattern.
 
-The tag with the latest commit date matching the condition will be output.
+The tag with the latest commit/release date or matching the condition will be output.
 If -A/--all flag is specified, all tags matching the condition will be printed 
-in order of the most recent commit date.
+in order of the most recent commit/release date.
 
 USAGE
   gh query-tags [[<sha1> | <pattern>] ...] [flags]
 
 FLAGS
-  -A, --all                Print all matching tags in order of the most recent
-                           commit date.
-  -R, --repo [OWNER/]REPO  Select repository using the [OWNER/]REPO format
+  -A, --all                   Print all matching tags in order of the most recent commit/release date
+      --exclude-pre-release   Exclude tags used for release marked as pre-release. Implicitly set --use-release
+      --include-draft         Include tags used for release marked as draft. Implicitly set --use-release
+      --jq expression         Filter JSON output using a jq expression. Implicitly set --json
+      --json                  Output JSON
+      --use-release           Use releases to query tags. If tags are not used to release, it will be ignored.
 
 INHERITED FLAGS
-  --help   Show help for command
+      --help                Show help for command
+  -R, --repo [OWNER/]REPO   Select repository using the [OWNER/]REPO format
 
 ARGUMENTS
-  Arguments matching /^[0-9a-f]{7,}$/ are treated as commit hash pointed by tag,
-  and the rest as regular expression patterns for tag names.
+  Arguments matching /^[0-9a-f]{7,}$/ are treated as commit hash pointed by tag, and the rest as regular expression patterns for tag names.
 
 USE STANDARD INPUT
-  Reads standard input, searches for words that match the hash pattern, and uses
-  them as hashes.
+  Reads standard input, searches for words that match the hash pattern, and uses them as hashes.
 
 EXAMPLES
   # print tag in apple/swift pointing commit with hash 8ae983c3480462b
@@ -36,121 +38,210 @@ EXAMPLES
   # swift -version in swiftlang/swift:nightly
   $ docker run --rm swiftlang/swift:nightly swift -version | gh query-tags --repo apple/swift
 
+  # print tag in swiftwasm/swift containing "swift-DEVELOPMENT-SNAPSHOT-2025-02-18-a" in the release
+  $ gh query-tags --repo swiftwasm/swift --use-release swift-DEVELOPMENT-SNAPSHOT-2025-02-18-a
+
 EOF
 }
 
 function is_hash() {
-  [[ "${1}" =~ ^[0-9a-f]{7,}$ ]]
+	[[ ${1} =~ ^[0-9a-f]{7,}$ ]]
 }
 
 function read_hashes_from_stdin() {
-  [[ ! -t 0 ]] || exit
-  local INPUTS=() input
-  IFS=$' \t\n-,:()' read -d '' -r -a INPUTS
-  for input in "${INPUTS[@]}"; do
-    is_hash ${input} && echo "\"${input}\""
-  done
+	[[ ! -t 0 ]] || exit
+	local INPUTS=() input
+	IFS=$' \t\n-,:()' read -d '' -r -a INPUTS
+	for input in "${INPUTS[@]}"; do
+		is_hash "${input}" && echo "\"${input}\""
+	done
 }
 
 # options
+# shellcheck disable=SC2207
 hashes=($(read_hashes_from_stdin)) # taking hashes from stdin
-patterns=()
-print_all=0
+jq_options=()
 owner='{owner}'
+patterns=()
+pattern_target_fields=()
+print_all=0
+print_json=0
 repo='{repo}'
+use_release_exclude_prereleases=0
+use_release_include_drafts=0
+use_release=0
 
 # parse arguments
 while [[ $# -gt 0 ]]; do
-  case "${1}" in
-    -A|--all)
-      print_all=1
-      shift
-      ;;
-    -R|--repo)
-      case "${2}" in
-        */*)
-          owner="${2%%/*}"
-          repo="${2#*/}"
-          ;;
-        *)
-          repo="${2}"
-          ;;
-      esac
-      shift 2
-      ;;
-    --help)
-      help
-      exit
-      ;;
-    -*|--*)
-      echo "Unknown option ${1}"
-      exit 1
-      ;;
-    *)
-      if is_hash "${1}"; then
-        hashes+=("\"${1}\"")
-      elif [[ -n "${1}" ]]; then
-        patterns+=("\"${1}\"")
-      fi
-      shift
-      ;;
-  esac
+	case "${1}" in
+	-A | --all)
+		print_all=1
+		shift
+		;;
+	--exclude-pre-release*)
+		use_release=1
+		use_release_exclude_prereleases=1
+		shift
+		;;
+	--help)
+		help
+		exit
+		;;
+	--include-draft*)
+		use_release=1
+		use_release_include_drafts=1
+		shift
+		;;
+	--jq)
+		jq_options+=("${2}")
+		print_json=1
+		shift 2
+		;;
+	--json)
+		print_json=1
+		shift
+		;;
+	-R | --repo)
+		case "${2}" in
+		*/*)
+			owner="${2%%/*}"
+			repo="${2#*/}"
+			;;
+		*)
+			repo="${2}"
+			;;
+		esac
+		shift 2
+		;;
+	--use-release*)
+		use_release=1
+		shift
+		;;
+	-*)
+		echo "Unknown option ${1}"
+		exit 1
+		;;
+	*)
+		if is_hash "${1}"; then
+			hashes+=("\"${1}\"")
+		elif [[ -n ${1} ]]; then
+			patterns+=("\"${1}\"")
+		fi
+		shift
+		;;
+	esac
 done
 
 # Using the gh api command to retrieve information
-readonly QUERY='
-  query($owner: String!, $name: String!, $endCursor: String) {
-    repository(owner: $owner, name: $name) {
-      refs(refPrefix: "refs/tags/", first: 100, after: $endCursor, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
-        pageInfo {
-          endCursor
-          hasNextPage
-        }
-        tags: nodes {
-          name
-          target {
-            ... on Tag {
-              commit: target {
-                oid
+
+# join arguments by using ${1} as separator
+function join() {
+	local IFS="${1}" && shift && echo "$*"
+}
+
+# query and converter is different for release and tag
+if [[ ${use_release} -eq 1 ]]; then
+	readonly release_fields=(createdAt isDraft isLatest isPrerelease name publishedAt description)
+	# shellcheck disable=SC2016
+	readonly QUERY='
+    query($owner: String!, $name: String!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        conn: releases(first: 100, after: $endCursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+          pageInfo {
+            endCursor
+            hasNextPage
+          }
+          nodes {
+            '"${release_fields[*]}"'
+            tag {
+              name
+              target {
+                ... on Commit {
+                  oid
+                }
+                ... on Tag {
+                  commit: target {
+                    oid
+                  }
+                }
               }
             }
           }
         }
       }
     }
-  }
-'
-
-function printf_with_joined_arguments() {
-  local format="${1}" arguments=()
-  while shift 1; do
-    test -n "${1}" && arguments+=("${1}") # non empty arguments only
-  done
-  [[ ${#arguments[@]} -ne 0 ]] && (IFS=,; printf "${format}" "${arguments[*]}") # arguments are joined with ","
-}
+  '
+	JQ_NODE_CONVERTER="{
+    name: .tag.name,
+    sha: (.tag | .target.commit.oid // .target.oid),
+    release: {$(join , "${release_fields[@]}")}
+  }"
+	pattern_target_fields=(".name" "${release_fields[@]/#/.release.}")
+else
+	# shellcheck disable=SC2016
+	readonly QUERY='
+    query($owner: String!, $name: String!, $endCursor: String) {
+      repository(owner: $owner, name: $name) {
+        conn: refs(refPrefix: "refs/tags/", first: 100, after: $endCursor, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
+          pageInfo {
+            endCursor
+            hasNextPage
+          }
+          nodes {
+            name
+            target {
+              ... on Commit {
+                oid
+              }
+              ... on Tag {
+                commit: target {
+                  oid
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  '
+	JQ_NODE_CONVERTER="{ name, sha: (.target.commit.oid // .target.oid) }"
+	pattern_target_fields=(".name")
+fi
 
 # Build jq query
-readonly CONDITIONS=(
-  "$(printf_with_joined_arguments "(.target.commit.oid|startswith(%s)?)" "${hashes[@]}")"
-  "$(printf_with_joined_arguments "(.name|test(%s))" "${patterns[@]}")"
-)
-readonly SELECT="$(printf_with_joined_arguments "|select([%s]|any)" "${CONDITIONS[@]}")"
-readonly JQ=".data.repository.refs|((.pageInfo|.hasNextPage,.endCursor),(.tags[]${SELECT}|.name))"
+JQ_MAP_EXPRESSIONS=("${JQ_NODE_CONVERTER}")
+
+CONDITIONS=()
+[[ ${#hashes[@]} -ne 0 ]] && CONDITIONS+=("(.sha|startswith($(join "," "${hashes[@]}")))")
+[[ ${#patterns[@]} -ne 0 ]] && CONDITIONS+=("($(join , "${pattern_target_fields[@]}" || true)|strings|test($(join "," "${patterns[@]}")))")
+
+[[ ${#CONDITIONS[@]} -ne 0 ]] && JQ_MAP_EXPRESSIONS+=("select([$(join "," "${CONDITIONS[@]}")]|any)")
+[[ ${use_release_exclude_prereleases} -eq 1 ]] && JQ_MAP_EXPRESSIONS+=("select(.release.isPrerelease|not)")
+[[ ${use_release_include_drafts} -eq 1 ]] || JQ_MAP_EXPRESSIONS+=("select(.release.isDraft|not)")
+
+JQ_NODES_EXPRESSIONS=(".nodes" "map($(join "|" "${JQ_MAP_EXPRESSIONS[@]}"))")
+[[ ${print_all} -eq 1 ]] || JQ_NODES_EXPRESSIONS+=("first")
+[[ ${print_json} -eq 1 ]] || JQ_NODES_EXPRESSIONS+=(".name")
+
+# shellcheck disable=SC2155
+readonly JQ=".data.repository.conn|(
+  (.pageInfo|.hasNextPage, .endCursor),
+  ($(join "|" "${JQ_NODES_EXPRESSIONS[@]}" "${jq_options[@]}"))
+)"
 
 # Run loops
 cursor="" found=
 readonly QUERY_CMD=(gh api graphql --cache 5m -f query="${QUERY}" --field owner="${owner}" --field name="${repo}" --jq "${JQ}")
-while result=($("${QUERY_CMD[@]}" --field endCursor="${cursor}")); do
-  if [[ ${#result[@]} -gt 2 ]]; then # found tag
-    found=1
-    if [[ $print_all -eq 0 ]]; then
-      echo ${result[2]}
-      break
-    else
-      printf "%s\n" "${result[@]:2}"
-    fi
-  fi
-  [[ "${result[0]}" != "true" ]] && break
-  cursor="${result[1]}"
+while result=$("${QUERY_CMD[@]}" --field endCursor="${cursor}"); do
+	if IFS= read -r hasNextPage; then
+		IFS= read -r cursor
+		json="$(cat)"
+		echo "${json}"
+		if [[ -n ${json} ]]; then
+			found=1
+			[[ ${print_all} -ne 1 ]] && break
+		fi
+	fi <<<"${result}"
+	[[ ${hasNextPage} != "true" ]] && break
 done
-test -n ${found} # set exit status
+test -n "${found}" # set exit status
