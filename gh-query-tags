@@ -220,8 +220,12 @@ CONDITIONS=()
 [[ ${use_release_include_drafts} -eq 1 ]] || JQ_MAP_EXPRESSIONS+=("select(.release.isDraft|not)")
 
 JQ_NODES_EXPRESSIONS=(".nodes" "map($(join "|" "${JQ_MAP_EXPRESSIONS[@]}"))")
-[[ ${print_all} -eq 1 ]] || JQ_NODES_EXPRESSIONS+=("first")
-[[ ${print_json} -eq 1 ]] || JQ_NODES_EXPRESSIONS+=(".name")
+[[ ${print_json} -eq 1 ]] || JQ_NODES_EXPRESSIONS+=("map(.name)")
+if [[ ${print_all} -eq 1 ]]; then
+  JQ_NODES_EXPRESSIONS+=(".[]")
+else
+  JQ_NODES_EXPRESSIONS+=("first")
+fi
 
 # shellcheck disable=SC2155
 readonly JQ=".data.repository.conn|(
