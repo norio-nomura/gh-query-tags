@@ -93,9 +93,10 @@ while [[ $# -gt 0 ]]; do
 		shift
 		;;
 	--jq)
-		jq_options+=("${2}")
+		shift 1
+		[[ -n "${1}" ]] && jq_options+=("${1}")
 		print_json=1
-		shift 2
+		shift 1
 		;;
 	--json)
 		print_json=1
