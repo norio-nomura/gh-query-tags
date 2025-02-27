@@ -243,8 +243,8 @@ while result=$("${QUERY_CMD[@]}" --field endCursor="${cursor}"); do
 	if IFS= read -r hasNextPage; then
 		IFS= read -r cursor
 		json="$(cat)"
-		echo "${json}"
 		if [[ -n ${json} ]]; then
+			echo "${json}"
 			found=1
 			[[ ${print_all} -ne 1 ]] && break
 		fi
