@@ -134,8 +134,8 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-# check if hashes are provided when stdin is not a tty
-[[ ! -t 0 && ${#hashes[@]} -eq 0 ]] && echo "No hashes provided" && exit 1
+# check if hashes or patterns are provided when stdin is not a tty
+[[ ! -t 0 && ${#hashes[@]} -eq 0 && ${#patterns[@]} -eq 0 ]] && echo "No hashes or patterns are provided" && exit 1
 
 # Using the gh api command to retrieve information
 
